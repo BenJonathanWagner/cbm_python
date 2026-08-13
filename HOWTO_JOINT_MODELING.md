@@ -1,7 +1,7 @@
 # How to fit a joint (cross-task) model
 
 A practical guide to `HBIConfig.covariance_blocks`. For what was changed in the
-toolbox and why, see `README_JOINT_MODELING.md`; for the caveats you should know
+toolbox and why, see `README_JOINT_MODELING.md`. For the caveats you should know
 before publishing a result, see its section 7.
 
 ---
