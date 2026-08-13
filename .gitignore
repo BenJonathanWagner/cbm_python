@@ -1,0 +1,10 @@
+.DS_Store
+__pycache__/
+*.pyc
+~$*
+*.egg-info/
+cbm/cbm_output*/
+examples/output*/
+*.pkl
+*.log
+README_JOINT_MODELING.docx

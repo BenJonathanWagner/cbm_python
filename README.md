@@ -5,6 +5,22 @@
 
 "Computational Brain/Behavior Modeling (CBM)" Library for model fitting and model selection.
 
+> [!NOTE]
+> **This branch adds cross-task joint modelling.**
+> `feature-joint-modeling` introduces an opt-in `HBIConfig.covariance_blocks`, which lets
+> the HBI group level carry a non-diagonal covariance over chosen parameter pairs — so you
+> can estimate how parameters covary across subjects, within or across tasks.
+>
+> - **To use it:** [HOWTO_JOINT_MODELING.md](HOWTO_JOINT_MODELING.md) — install, a worked
+>   example, and the settings that matter.
+> - **To review it:** [README_JOINT_MODELING.md](README_JOINT_MODELING.md) — a file-by-file
+>   diff against upstream `ccb8aa8`, with the open questions in section 7.
+> - **To check it:** `python -m cbm.test_joint_elbo` — confirms the joint branch reproduces
+>   the standard branch exactly when no pairs are linked.
+>
+> This is a fork, not part of the official CBM toolbox. Please send joint-modelling
+> questions to Ben J. Wagner (ben.wagner@tuebingen.mpg.de) rather than upstream.
+
 ## Overview
 
 CBM provides a complete pipeline for fitting computational models to behavioral data and comparing competing models at the group level. The toolkit implements three core methods:

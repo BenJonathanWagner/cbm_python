@@ -1,5 +1,6 @@
 import os
 import pickle
+import warnings
 from copy import deepcopy
 from datetime import datetime
 from typing import Any, Dict, List, Tuple, Union
@@ -45,8 +46,11 @@ def _hbi_prog(
     x_pre = last.normalized_params
 
     thetabar_vec = np.concatenate([tb.ravel() for tb in thetabar])
-    Sdiag_vec = np.concatenate([sd.ravel() for sd in Sdiag])
-    x = thetabar_vec / np.sqrt(Sdiag_vec)
+    
+    # --- NEW: Extract the diagonal if it's a 2D matrix! ---
+    Sdiag_vec = np.concatenate([np.diag(sd) if sd.ndim == 2 else sd.ravel() for sd in Sdiag])
+    
+    x = thetabar_vec / np.sqrt(np.maximum(np.abs(Sdiag_vec), 1e-10))  # guard zero-variance from collapsed models
 
     dx = np.sqrt(np.mean((x - x_pre) ** 2))
     dL = float(L - L_pre)
@@ -100,13 +104,43 @@ def hbi_main(data: List[Any], models: List[Any], fcbm_maps: List[str], fname: st
     s = 0.01
     hyper = {"b": b, "v": v, "s": s}
 
-    # Initialize HBI
+    # Initialize HBI. The responsibility initialization comes from
+    # config.initialize (HBIConfig validates the allowed values); previously
+    # this was hard-coded to 'all_r_1' and the config field was silently
+    # ignored.
+    _init_r = 'all_r_1'
+    if config is not None:
+        if isinstance(config, HBIConfig):
+            _init_r = getattr(config, 'initialize', 'all_r_1') or 'all_r_1'
+        elif isinstance(config, dict):
+            _init_r = config.get('initialize', 'all_r_1') or 'all_r_1'
     inits, priors, opt_configs = hbi_init(
         fcbm_maps,
         hyper,
         limInf=0,
-        initialize_r='all_r_1',
+        initialize_r=_init_r,
     )
+
+    # Optional empirical-Bayes recentering of the group-mean hyperprior
+    # (config.recenter_a0): replace each model's a0 with the mean of its
+    # individual-fit MAP estimates. This neutralizes the
+    # (thetabar - a0)(thetabar - a0)^T term of the Normal-Wishart scale
+    # update, whose off-diagonals otherwise inject spurious covariance
+    # into linked parameter pairs when a0 is badly mis-centered (see
+    # HBIConfig.recenter_a0). Only the hyperprior MEAN changes; all update
+    # equations and every other hyperparameter stay untouched.
+    _recenter = False
+    if config is not None:
+        if isinstance(config, HBIConfig):
+            _recenter = bool(getattr(config, 'recenter_a0', False))
+        elif isinstance(config, dict):
+            _recenter = bool(config.get('recenter_a0', False))
+    if _recenter:
+        for k, _pmt in enumerate(priors["pmutau"]):
+            _theta_k = np.asarray(inits["qh"].parameters[k], dtype=float)  # (D, N)
+            _finite = np.all(np.isfinite(_theta_k), axis=0)
+            if _finite.sum() >= 2:
+                _pmt.a = _theta_k[:, _finite].mean(axis=1)
 
     # Run HBI
     cbm = hbi_run(data, user_input, inits, priors, opt_configs)
@@ -143,6 +177,7 @@ def hbi_run(data: List[Any], user_input: Dict[str, Any], inits: Dict[str, Any], 
     verbose = bool(config.verbose)
     maxiter = config.maxiter
     tolx = config.tolx
+    tolL = config.tolL
 
     if (flog is None or flog == "") and fname:
         fdir, fn = os.path.split(fname)
@@ -183,24 +218,118 @@ def hbi_run(data: List[Any], user_input: Dict[str, Any], inits: Dict[str, Any], 
     terminate = False
     it = 0
     math_list: List[Dict[str, Any]] = []
+    
+    #added a block here
+    
+    auto_nu0 = bool(getattr(config, 'auto_nu0', False))
+    nu0_margin = float(getattr(config, 'nu0_margin', 1.0))
+
+    # ELBO divergence guard (see HBIConfig.keep_best_iterate / divergence_tol)
+    keep_best_iterate = bool(getattr(config, 'keep_best_iterate', False))
+    divergence_tol = getattr(config, 'divergence_tol', None)
+    divergence_tol = None if divergence_tol is None else float(divergence_tol)
+    diverged_at = None   # iteration index where the bound broke, if it did
+
+    covariance_mask = None
+    if hasattr(config, 'covariance_blocks') and config.covariance_blocks is not None:
+        covariance_mask = [None] * K
+        for k in range(K):
+            if k < len(config.covariance_blocks) and config.covariance_blocks[k] is not None:
+                # Find number of parameters for this specific model
+                Dk = len(pmutau[k].a) if isinstance(pmutau[k], GaussianGammaDistribution) else len(pmutau[k]["a"])
+                
+                # Start with a diagonal of 1s (independent variances)
+                mask_k = np.eye(Dk, dtype=float)
+                
+                # Add 1s symmetrically for any user-linked parameters
+                for (i, j) in config.covariance_blocks[k]:
+                    mask_k[i, j] = 1.0
+                    mask_k[j, i] = 1.0
+                    
+                covariance_mask[k] = mask_k
+
+    # -----------------------------------------------------------------------
+    # recenter_a0 is not cosmetic once a covariance block is in play. The
+    # (thetabar - a0)(thetabar - a0)^T term of the Normal-Wishart scale update
+    # is RANK ONE, so its own correlation is exactly +1 whenever two linked
+    # parameters' group means sit on the same side of a0 -- the usual case,
+    # since a0 comes from generic individual-fit priors. It therefore inflates
+    # the estimated correlation between exactly the pairs the user asked about.
+    #
+    # Measured over 20 paired replications (N=80, true r=0.5, one dataset fit
+    # twice): bias +0.069 (t=4.3, p=0.0004) with recenter_a0=False, versus
+    # -0.007 (t=-0.4) with it on; RMSE 0.098 vs 0.079. See mc_recenter_a0.py.
+    #
+    # The default is left at False so that existing scripts keep their
+    # behaviour, so this warns instead. Only fires when the mask actually links
+    # something -- an all-identity mask has no off-diagonal to corrupt.
+    # -----------------------------------------------------------------------
+    if covariance_mask is not None and not bool(getattr(config, 'recenter_a0', False)):
+        _links = any(
+            m is not None and np.any(np.asarray(m) - np.diag(np.diag(np.asarray(m))) != 0)
+            for m in covariance_mask
+        )
+        if _links:
+            _msg = (
+                "covariance_blocks links at least one parameter pair but "
+                "recenter_a0=False. The (thetabar - a0)(thetabar - a0)^T term of "
+                "the scale update is rank one and inflates the correlation "
+                "between linked parameters whenever their group means sit on the "
+                "same side of a0. Measured bias +0.069 (t=4.3) with it off vs "
+                "-0.007 (t=-0.4) with it on. Set recenter_a0=True unless you "
+                "have a specific reason not to."
+            )
+            warnings.warn(_msg, RuntimeWarning, stacklevel=2)
+            hbi_log(verbose, fid, "  WARNING: " + _msg + "\n")
 
     while not terminate and it <= maxiter:
         it += 1
         hbi_log(verbose, fid, f"Iteration {it:02d}\n")
-        Nbar, thetabar, Sdiag = hbi_sumstats(r, qhquad)
-        qmutau, bound_qmutau = hbi_qmutau(pmutau, Nbar, thetabar, Sdiag)
+        
+        # ---> ADD THE MASK ARGUMENTS HERE <---
+        Nbar, thetabar, Sdiag = hbi_sumstats(r, qhquad, covariance_mask=covariance_mask)
+        qmutau, bound_qmutau = hbi_qmutau(
+            pmutau, Nbar, thetabar, Sdiag,
+            covariance_mask=covariance_mask,
+            auto_nu0=auto_nu0,
+            nu0_margin=nu0_margin,
+        )
+        
         bound.qmutau = bound_qmutau
         bound, _ = hbi_bound(bound, "qmutau")
         qm, bound_qm = hbi_qm(pm, Nbar)
         bound.qm = bound_qm
         bound, _ = hbi_bound(bound, "qm")
         qhquad = hbi_qhquad(models, data, optconfigs, qmutau, qhquad, fid)
-        r, bound_qHZ = hbi_qHZ(qmutau, qm, qhquad, thetabar, Sdiag)
+        
+        ##
+    
+        r, bound_qHZ = hbi_qHZ(qmutau, qm, qhquad, thetabar, Sdiag, covariance_mask=covariance_mask)
+        
+        ##
+        
         bound.qHZ = bound_qHZ
         bound, _ = hbi_bound(bound, "qHZ")
         prog_change, prog = _hbi_prog(prog, bound.bound.L, qm.alpha, thetabar, Sdiag)
         if prog_change.change_parameters < tolx:
             terminate = True
+        # Also converge when the ELBO itself stops moving (finite dL only)
+        if it > 2 and np.isfinite(prog_change.change_bound) and abs(prog_change.change_bound) < tolL:
+            terminate = True
+        # Divergence guard: in exact variational EM the bound is
+        # non-decreasing, so a large negative dL means the bound has broken
+        # (typically one subject's Laplace refit losing positive-definiteness,
+        # which makes its covariance block near-singular). Continuing from
+        # here usually produces a limit cycle rather than a recovery, so stop
+        # and -- with keep_best_iterate -- fall back to the best iterate.
+        _dL = prog_change.change_bound
+        if divergence_tol is not None and it > 1:
+            if (not np.isfinite(_dL)) or (_dL < -divergence_tol):
+                diverged_at = it
+                terminate = True
+                hbi_log(verbose, fid,
+                        f"  ELBO divergence detected at iteration {it:02d} "
+                        f"(dL={_dL:.2f} < -{divergence_tol:g}); stopping early.\n")
         if it > 1:
             log_iteration(verbose, fid, verbose_multiK, fid_multiK, it, Nbar, N, prog_change, terminate, K)
         math_iter = {
@@ -224,6 +353,87 @@ def hbi_run(data: List[Any], user_input: Dict[str, Any], inits: Dict[str, Any], 
             with open(fname_prog, "wb") as f:
                 pickle.dump(math_list, f)
 
+    # -----------------------------------------------------------------------
+    # keep_best_iterate: return the state from the iteration with the highest
+    # finite bound, instead of whatever the last iteration happened to be.
+    # The per-iteration snapshots in math_list are already full deepcopies, so
+    # this is a pure selection step -- no extra copying, and it is a no-op
+    # when the run converged normally (the last iteration IS the best one).
+    # -----------------------------------------------------------------------
+    if keep_best_iterate and len(math_list) > 0:
+        _Ls = np.array([
+            float(m["bound"].bound.L) if np.isfinite(np.float64(m["bound"].bound.L)) else -np.inf
+            for m in math_list
+        ], dtype=float)
+        # IMPORTANT: do not take a global argmax. Once the bound breaks it can
+        # swing in BOTH directions (the observed failure mode is a limit cycle
+        # alternating by +-1e6), so the largest L in the whole run may itself be
+        # a corrupted value. The trustworthy region is the initial prefix over
+        # which the bound never dropped materially -- variational EM guarantees
+        # a non-decreasing bound, so the first material drop marks the break.
+        # A break is either (a) a material DROP in the bound, or (b) a jump of
+        # either sign that is wildly out of scale with the run's own history --
+        # the first corrupted iteration often sends L sharply UP, so a
+        # drop-only rule would happily select it. In a healthy EM run |dL|
+        # shrinks monotonically toward zero, so it never exceeds a large
+        # multiple of the largest |dL| seen so far.
+        _break_tol = divergence_tol if divergence_tol is not None else max(1.0, 10.0 * float(tolL))
+        _BREAK_FACTOR = 100.0
+        _cut = len(_Ls)
+        _run_max = None
+        for _i in range(1, len(_Ls)):
+            _d = _Ls[_i] - _Ls[_i - 1]
+            if (not np.isfinite(_Ls[_i])) or (not np.isfinite(_d)):
+                _cut = _i
+                break
+            if _d < -_break_tol:
+                _cut = _i
+                break
+            if _run_max is not None and abs(_d) > _BREAK_FACTOR * max(_run_max, _break_tol):
+                _cut = _i
+                break
+            _run_max = abs(_d) if _run_max is None else max(_run_max, abs(_d))
+        _Ls_pref = _Ls[:_cut]
+        if len(_Ls_pref) > 0 and np.any(np.isfinite(_Ls_pref)):
+            _best = int(np.nanargmax(_Ls_pref))
+            if _best != len(math_list) - 1:
+                _bm = math_list[_best]
+                qhquad = _bm["qhquad"]
+                r       = _bm["r"]
+                Nbar    = _bm["Nbar"]
+                thetabar = _bm["thetabar"]
+                Sdiag   = _bm["Sdiag"]
+                pm      = _bm["pm"]
+                pmutau  = _bm["pmutau"]
+                qm      = _bm["qm"]
+                qmutau  = _bm["qmutau"]
+                bound   = _bm["bound"]
+                prog    = _bm["prog"]
+                hbi_log(verbose, fid,
+                        f"  keep_best_iterate: returning iteration {_best + 1:02d} "
+                        f"(L={_Ls[_best]:.2f}) instead of the final iteration "
+                        f"{len(math_list):02d} (L={_Ls[-1]:.2f}); the bound first "
+                        f"broke at iteration {_cut + 1:02d}.\n"
+                        if _cut < len(_Ls) else
+                        f"  keep_best_iterate: returning iteration {_best + 1:02d} "
+                        f"(L={_Ls[_best]:.2f}) instead of the final iteration "
+                        f"{len(math_list):02d} (L={_Ls[-1]:.2f}).\n")
+            else:
+                hbi_log(verbose, fid,
+                        "  keep_best_iterate: final iteration was already the best; "
+                        "nothing to restore.\n")
+        else:
+            hbi_log(verbose, fid,
+                    "  keep_best_iterate: no finite bound in any iteration; "
+                    "returning the final state unchanged.\n")
+
+    if diverged_at is not None and not keep_best_iterate:
+        hbi_log(verbose, fid,
+                f"  WARNING: run stopped on ELBO divergence at iteration "
+                f"{diverged_at:02d} and keep_best_iterate is off, so the "
+                f"returned state is the diverged one. Set keep_best_iterate="
+                f"True to fall back to the last good iteration.\n")
+
     qmutau_list: List[GaussianGammaDistribution] = qmutau
     he_list: List[np.ndarray] = [None] * K
     nk_vec: np.ndarray = np.zeros(K, dtype=float)
@@ -231,6 +441,11 @@ def hbi_run(data: List[Any], user_input: Dict[str, Any], inits: Dict[str, Any], 
         nu = qmutau_list[k].nu
         beta = qmutau_list[k].beta
         sigma = np.asarray(qmutau_list[k].sigma)
+        if sigma.ndim == 2:
+            # Joint models store the full inverse-scale matrix; the
+            # per-parameter hierarchical error bar uses its diagonal
+            # (sqrt of the full matrix would produce NaNs off-diagonal).
+            sigma = np.diag(sigma).copy()
         s2 = 2.0 * sigma / beta
         nk = 2.0 * nu
         he_list[k] = np.sqrt(s2 / nk)
@@ -270,7 +485,11 @@ def hbi_run(data: List[Any], user_input: Dict[str, Any], inits: Dict[str, Any], 
         datetime=datetime.now().isoformat(),
         filename="cbm_hbi_hbi",
         config=config,
-        optimconfigs=optconfigs,
+        # Store as dicts to avoid pickle class-identity issues (same reason as
+        # FitProfile.config).  hbi_null reads cbm.input.optimconfigs, not this
+        # field, so nothing downstream is broken.
+        optimconfigs=[cfg.__dict__.copy() if hasattr(cfg, '__dict__') else cfg
+                      for cfg in optconfigs],
         hyperparameters=hyper_out,
     )
 
@@ -354,39 +573,94 @@ def hbi_init(flap, hyper, limInf=0, initialize_r='all_r_1', families=None):
         L=np.nan,
         dL=np.nan,
     )
+    from .optimization import Config as _Config
     opt_configs = []
     for k in range(K):
         cbm_map = cbm_maps[k]
         opt_config = cbm_map.profile.config
+        # FitProfile.config may be stored as a plain dict (new behaviour) or
+        # as a Config object (old pickles). Normalise to Config here so the
+        # rest of hbi_run can always use attribute access.
+        if isinstance(opt_config, dict):
+            opt_config = _Config(**opt_config)
         opt_configs.append(opt_config)
+    
     logrho = []
     theta = []
     Ainvdiag = []
+    Ainv_full = []  # <--- NEW: Master list for full inverse Hessians
     logdetA = []
     logf = []
     D = []
     a0 = []
     N = cbm_maps[0].output.parameters.shape[0]
+    
     for k in range(K):
         cbm_map = cbm_maps[k]
-        logrho.append(np.asarray(cbm_map.math.lme))
-        logf.append(np.asarray(cbm_map.math.loglik))
-        a0.append(np.asarray(cbm_map.profile.prior_mean))
+        a0_k = np.asarray(cbm_map.profile.prior_mean).ravel()
+        
         theta_k = cbm_map.math.parameters
         Ainvdiag_k = cbm_map.math.hessian_inv_diag
+        hessian_k = cbm_map.math.hessian
+        
+        Dk = len(a0_k)
+        Ainv_full_k = np.zeros((Dk, Dk, N), dtype=float)
+        
+        # =====================================================================
+        # --- NEW: Aggressive Scrubber for Failed/Runaway Subjects ---
+        # =====================================================================
+        # =====================================================================
+        # --- NEW: Aggressive Scrubber for Failed/Runaway Subjects ---
+        # =====================================================================
+        for n in range(N):
+            # 1. Check if ANY output from the individual fit is corrupted (NaN/Inf)
+            is_invalid = (
+                not np.all(np.isfinite(theta_k[n])) or
+                not np.all(np.isfinite(hessian_k[n])) or
+                not np.all(np.isfinite(Ainvdiag_k[n])) or
+                not np.isfinite(cbm_map.math.loglik[n])
+            )
+            # 2. Check if the optimizer "ran away" to a massive number
+            is_runaway = np.any(np.abs(theta_k[n]) > 1000.0)
+            
+            if is_invalid or is_runaway:
+                # If subject failed or ran away, replace with neutral prior fallbacks
+                theta_k[n] = a0_k.copy()
+                hessian_k[n] = np.eye(Dk) * 0.1
+                Ainvdiag_k[n] = np.ones(Dk) * 10.0
+                
+                # Neutralize log-likelihoods so they don't break EM responsibilities
+                cbm_map.math.loglik[n] = -1e6
+                cbm_map.math.lme[n] = -1e6
+                cbm_map.math.log_det_hessian[n] = 0.0
+                
+            # Safely invert the matrix
+            Ainv_full_k[:, :, n] = np.linalg.pinv(hessian_k[n])
+        # =====================================================================
+        # =====================================================================
+            
+        Ainv_full.append(Ainv_full_k)
         theta.append(np.column_stack(theta_k))
         Ainvdiag.append(np.column_stack(Ainvdiag_k))
+        
+        logrho.append(np.asarray(cbm_map.math.lme))
+        logf.append(np.asarray(cbm_map.math.loglik))
         logdetA.append(np.asarray(cbm_map.math.log_det_hessian))
-        D.append(theta[k].shape[0])
+        a0.append(a0_k)
+        D.append(Dk)
+        
     logf_mat = np.vstack(logf)
     logdetA_mat = np.vstack(logdetA)
     D = np.array(D)
+    
     qh = IndividualPosterior(
         loglik=logf_mat,
         parameters=theta,
         hessian_inv_diag=Ainvdiag,
         log_det_hessian=logdetA_mat,
+        hessian_inv=Ainv_full,  # <--- NEW: Inject it into the starting dataclass!
     )
+    
     a = []
     beta = []
     sigma = []
@@ -464,6 +738,25 @@ def hbi_init(flap, hyper, limInf=0, initialize_r='all_r_1', families=None):
     lme = np.vstack(logrho).T
     if initialize_r == 'all_r_1':
         r = np.ones((K, N))
+    elif initialize_r == 'lme_softmax':
+        # Break the K>1 symmetry using the individual fits' per-subject log
+        # model evidence: each subject starts mostly assigned to the model
+        # whose INDEPENDENT fit explains them better (softmax over models of
+        # lme -- the same formula the E-step's r update uses, applied once at
+        # initialization).
+        #
+        # Why this exists: with 'all_r_1' every subject starts fully assigned
+        # to EVERY model, so when the K models share one likelihood and differ
+        # only in their priors (a population-mixture setup), the first M-step
+        # hands all components the same responsibility-weighted mean and they
+        # merge immediately -- the responsibilities may still split later, but
+        # the component means never separate. Evidence-based initialization
+        # starts the components apart, at the subjects their own priors favor.
+        lme_safe = np.where(np.isfinite(lme), lme, -1e10)   # (N, K)
+        z = lme_safe - lme_safe.max(axis=1, keepdims=True)
+        w = np.exp(z)
+        w /= np.clip(w.sum(axis=1, keepdims=True), 1e-300, None)
+        r = np.ascontiguousarray(w.T)                        # (K, N)
     else:
         raise NotImplementedError(
             f"initialize_r option '{initialize_r}' not implemented."

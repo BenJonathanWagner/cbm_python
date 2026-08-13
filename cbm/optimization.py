@@ -379,8 +379,11 @@ class BFGSOptimizer:
                 result = self._single_optimization(func, x0)
                 self.all_results.append(result)
 
-                # Keep track of best result (lowest function value)
-                if result.f < best_f:
+                # Keep track of best result (lowest function value).
+                # Use `best_result is None` as the first-run guard so that NaN
+                # f-values (which make NaN < inf == False) don't leave
+                # best_result as None and crash the Hessian computation below.
+                if best_result is None or (np.isfinite(result.f) and result.f < best_f):
                     best_f = result.f
                     best_result = result
                     best_history_x = self._temp_history_x

@@ -65,9 +65,9 @@ class FitProfile:
     datetime: str
     filename: str  # function name
     telapsed: float
-    config: Config
-    prior_mean: np.ndarray  
-    prior_precision: np.ndarray    
+    config: Any  # stored as plain dict to avoid pickle class-identity issues
+    prior_mean: np.ndarray
+    prior_precision: np.ndarray
 
 @dataclass
 class FitMath:
@@ -246,7 +246,7 @@ def individual_fit(data: List[Any],
         datetime=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         filename='individual_fit',
         telapsed=t_elapsed,
-        config=config,
+        config=config.__dict__.copy(),  # dict avoids pickle class-identity issues
         prior_mean=prior.mean,
         prior_precision=prior.precision    
     )

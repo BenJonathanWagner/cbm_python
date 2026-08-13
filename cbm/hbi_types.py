@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 from typing import Any, Dict, List
+from typing import Optional #added
 import numpy as np
+
 
 @dataclass
 class IndividualPosterior:
@@ -8,6 +10,7 @@ class IndividualPosterior:
     parameters: List[np.ndarray]
     hessian_inv_diag: List[np.ndarray]
     log_det_hessian: np.ndarray
+    hessian_inv: Optional[List[np.ndarray]] = None  # added full covariance matrix
 
 @dataclass
 class ProgressChange:

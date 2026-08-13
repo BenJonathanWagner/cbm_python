@@ -33,7 +33,11 @@ def log_posterior(parameters: np.ndarray,
     # Compute log prior
     diff = parameters.reshape(-1, 1) - prior_mean.reshape(-1, 1)
     # log_det_precision = np.linalg.slogdet(prior_precision)[1]
-    log_det_precision = np.log(np.linalg.det(prior_precision))
+    # --- OLD (Line 36) ---
+    # log_det_precision = np.log(np.linalg.det(prior_precision))
+    
+    # --- NEW ---
+    log_det_precision = np.linalg.slogdet(prior_precision)[1]
     log_prior = -len(diff) / 2 * np.log(2 * np.pi) + 0.5 * log_det_precision - 0.5 * (diff.T @ prior_precision @ diff).item()
 
     return (log_lik + log_prior)
